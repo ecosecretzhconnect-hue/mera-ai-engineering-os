@@ -1,0 +1,29 @@
+# Build
+outputs/
+*.exe
+*.zip
+dist/
+
+# Runtime
+.mera/
+*.log
+install.state.json
+repo-index.json
+profile.json
+config.json
+models.json
+
+# Go
+bin/
+coverage.out
+*.test
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Windows
+Thumbs.db
+Desktop.ini

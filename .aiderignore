@@ -1,0 +1,15 @@
+.git
+bin
+obj
+node_modules
+.next
+dist
+build
+coverage
+.vs
+.idea
+*.user
+*.suo
+*.cache
+.mera/logs
+.mera/reports
