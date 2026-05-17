@@ -1,3 +1,6 @@
+# Local workspace (Claude Code, editor state — never commit)
+.claude/
+
 # Build
 outputs/
 *.exe
