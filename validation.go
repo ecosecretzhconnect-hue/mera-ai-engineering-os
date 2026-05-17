@@ -142,9 +142,9 @@ func runCommandStep(title, command string) bool {
 	ctx := context.Background()
 	var err error
 	if runtime.GOOS == "windows" {
-		err = runInteractive(ctx, "cmd", []string{"/c", command}, 0, 0)
+		err = runInteractive(ctx, "cmd", []string{"/c", command}, 0, 0, 0)
 	} else {
-		err = runInteractive(ctx, "sh", []string{"-lc", command}, 0, 0)
+		err = runInteractive(ctx, "sh", []string{"-lc", command}, 0, 0, 0)
 	}
 	if err != nil {
 		fmt.Printf("[FAIL] %s failed: %v\n", title, err)

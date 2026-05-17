@@ -34,10 +34,16 @@ func capture(n string, args ...string) string {
 	return out.String()
 }
 
+// stdinReader is a single package-level buffered reader for os.Stdin.
+// Using one shared reader is critical when stdin is piped from a file (e.g. automated tests):
+// each call to bufio.NewReader(os.Stdin) pre-buffers the entire pipe content into its
+// internal buffer, then discards it when the local variable is GC'd — so only the first
+// promptLine call would ever see data. A shared reader retains the buffer across calls.
+var stdinReader = bufio.NewReader(os.Stdin)
+
 func promptLine(label string) string {
 	fmt.Print(label + ": ")
-	r := bufio.NewReader(os.Stdin)
-	s, _ := r.ReadString('\n')
+	s, _ := stdinReader.ReadString('\n')
 	return strings.TrimSpace(s)
 }
 

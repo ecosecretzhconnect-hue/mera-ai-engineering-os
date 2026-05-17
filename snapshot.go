@@ -62,18 +62,27 @@ func rollback() error {
 		fmt.Println("[WARN] Rollback cancelled.")
 		return nil
 	}
-	_ = runInteractive(context.Background(), "git", []string{"reset", "--hard", s.SHA}, 0, 0)
-	_ = runInteractive(context.Background(), "git", []string{"clean", "-fdx"}, 0, 0)
+	_ = runInteractive(context.Background(), "git", []string{"reset", "--hard", s.SHA}, 0, 0, 0)
+	_ = runInteractive(context.Background(), "git", []string{"clean", "-fdx"}, 0, 0, 0)
 	fmt.Println("[OK] Rollback complete.")
 	return nil
 }
 
+// changedFiles returns relative paths of files modified relative to HEAD.
+// Uses "git diff --name-only HEAD" so only tracked file changes are counted
+// (untracked files shown as "??" in git status are excluded).
+// Falls back to --cached (staged only) if HEAD doesn't exist yet (brand-new repo).
 func changedFiles() []string {
-	out := capture("git", "status", "--porcelain")
+	out := strings.TrimSpace(capture("git", "diff", "--name-only", "HEAD"))
+	if out == "" {
+		// Brand-new repo or clean working tree — try staged changes only.
+		out = strings.TrimSpace(capture("git", "diff", "--name-only", "--cached"))
+	}
 	var fs []string
 	for _, l := range strings.Split(out, "\n") {
-		if len(l) > 3 {
-			fs = append(fs, strings.TrimSpace(l[3:]))
+		l = strings.TrimSpace(l)
+		if l != "" {
+			fs = append(fs, l)
 		}
 	}
 	return fs

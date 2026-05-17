@@ -210,3 +210,14 @@ func joinOrPrompt(i int, label string) string {
 	}
 	return s
 }
+
+// deepPlanRequested returns true when the user passes --deep-plan on the command line.
+// This opts out of the BUGFIX_NARROW deterministic planner and forces a full LLM plan.
+func deepPlanRequested() bool {
+	for _, a := range os.Args {
+		if strings.EqualFold(a, "--deep-plan") {
+			return true
+		}
+	}
+	return false
+}

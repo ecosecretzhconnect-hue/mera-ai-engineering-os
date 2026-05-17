@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+// narrowFileLimit is the hard file cap applied to BUGFIX_NARROW tasks.
+// Controller + request DTO + service implementation is sufficient for the vast majority
+// of narrow endpoint bugfixes. Anything beyond 3 files (JWT helpers, OpenAPI filters,
+// schema examples) adds noise and increases the risk of Aider context overflow.
+const narrowFileLimit = 3
+
 // AgentResult is the output of a single MERA workflow agent.
 // Evidence is populated only by File Scout and carries per-file confidence data.
 // RejectedCandidates lists scored files that were excluded (BUGFIX_NARROW scope only).
@@ -29,8 +35,17 @@ type candidateFile struct {
 	relPath string
 }
 
-// plannerAgent decomposes the task into concrete implementation steps via Ollama (streamed).
+// plannerAgent decomposes the task into concrete implementation steps.
+//
+// BUGFIX_NARROW fast path: returns a deterministic plan instantly without calling Ollama.
+// The LLM path is only used when the task scope is broader OR when --deep-plan is passed.
+// This eliminates the #1 source of pre-Aider latency (phi4 planning call, typically 60-180s).
 func plannerAgent(target, task string) AgentResult {
+	scope := classifyTaskScope(task)
+	if scope == ScopeBugfixNarrow && !deepPlanRequested() {
+		return deterministicPlannerResult(target, task)
+	}
+
 	p := detectProject()
 	prompt := fmt.Sprintf(`You are a senior software engineering planner.
 
@@ -42,7 +57,7 @@ Break this task into 3-5 concrete, scoped implementation steps.
 For each step name the exact layer it touches: controller, service, DTO, model, config, migration, test.
 No preamble. Return a numbered list only.`, p.Type, target, task)
 
-	fmt.Println("[AGENT] Planner running...")
+	fmt.Println("[AGENT] Planner running (LLM)...")
 	start := time.Now()
 	out, model, err := generateForRole(RolePlanner, prompt, true)
 	elapsed := time.Since(start).Milliseconds()
@@ -55,9 +70,57 @@ No preamble. Return a numbered list only.`, p.Type, target, task)
 	return AgentResult{Agent: "Planner", Status: "completed", Output: out, Model: model, DurationMs: elapsed}
 }
 
-// architectAgent analyzes architectural impact via Ollama (streamed).
-// DEEP/STRICT profiles trigger extended analysis via DeeperArchitect setting.
+// deterministicPlannerResult builds a precise, immediate plan for BUGFIX_NARROW tasks.
+// No Ollama call — derived from task keywords and project conventions.
+func deterministicPlannerResult(target, task string) AgentResult {
+	taskL := strings.ToLower(task)
+	fmt.Println("[AGENT] Planner: BUGFIX_NARROW fast path — deterministic plan (no LLM).")
+
+	var sb strings.Builder
+	sb.WriteString("Deterministic plan (BUGFIX_NARROW — skipped LLM, use --deep-plan to enable):\n\n")
+
+	// Step 1: always inspect the controller / endpoint entry point
+	sb.WriteString("1. Controller layer — inspect action signature, [FromBody] attribute, HTTP verb, and route; confirm they match the failing request exactly.\n")
+
+	// Step 2: DTO / request model
+	sb.WriteString("2. DTO layer — verify all required fields carry [Required] (or equivalent), correct types, and no name mismatches with the serialized JSON.\n")
+
+	// Step 3: service or auth logic if relevant
+	if strings.Contains(taskL, "auth") || strings.Contains(taskL, "login") ||
+		strings.Contains(taskL, "token") || strings.Contains(taskL, "credential") {
+		sb.WriteString("3. Auth service — confirm the service method receives the correct parameters from the controller; check for null-guard or early return that could short-circuit the flow.\n")
+	} else if strings.Contains(taskL, "service") || strings.Contains(taskL, "logic") {
+		sb.WriteString("3. Service layer — trace the call chain from controller to service; confirm parameter and return types align.\n")
+	} else {
+		sb.WriteString("3. Service / dependency — trace one layer down from the controller to confirm the call succeeds with the corrected input.\n")
+	}
+
+	// Step 4: apply patch
+	sb.WriteString("4. Apply minimal targeted patch — one change per layer, smallest possible diff; do not refactor or rename unrelated code.\n")
+
+	// Step 5: validate
+	sb.WriteString("5. Build → test → review git diff — confirm compilation, tests pass, and no unintended files changed.")
+
+	appendMeraLog("INFO", fmt.Sprintf("Deterministic planner used for BUGFIX_NARROW target=%s", target))
+	return AgentResult{
+		Agent:  "Planner",
+		Status: "completed",
+		Output: sb.String(),
+		Model:  "deterministic",
+	}
+}
+
+// architectAgent analyzes architectural impact.
+//
+// BUGFIX_NARROW fast path: returns a deterministic architectural summary derived from
+// task keywords without calling Ollama. Eliminates the architect LLM call (typically 60-120s).
+// DEEP/STRICT profiles trigger extended LLM analysis via DeeperArchitect setting.
 func architectAgent(target, task string) AgentResult {
+	scope := classifyTaskScope(task)
+	if scope == ScopeBugfixNarrow && !deepPlanRequested() {
+		return deterministicArchitectResult(target, task)
+	}
+
 	p := detectProject()
 	depthHint := "5-8 lines max. Be specific."
 	if getProfileSettings().DeeperArchitect {
@@ -77,7 +140,7 @@ Analyze:
 
 %s`, p.Type, target, task, depthHint)
 
-	fmt.Println("[AGENT] Architect running...")
+	fmt.Println("[AGENT] Architect running (LLM)...")
 	start := time.Now()
 	out, model, err := generateForRole(RoleArchitect, prompt, true)
 	elapsed := time.Since(start).Milliseconds()
@@ -88,6 +151,68 @@ Analyze:
 	}
 	fmt.Println("[AGENT] Architect done.")
 	return AgentResult{Agent: "Architect", Status: "completed", Output: out, Model: model, DurationMs: elapsed}
+}
+
+// deterministicArchitectResult builds a precise architectural summary for BUGFIX_NARROW tasks.
+// Derives layers, blast radius, and risks from task keywords — no Ollama call required.
+func deterministicArchitectResult(target, task string) AgentResult {
+	taskL := strings.ToLower(task)
+	fmt.Println("[AGENT] Architect: BUGFIX_NARROW fast path — deterministic analysis (no LLM).")
+
+	// Identify which layers from task keywords
+	var layers []string
+	if strings.ContainsAny(taskL, "controller endpoint api route") {
+		layers = append(layers, "controller")
+	}
+	if strings.Contains(taskL, "dto") || strings.Contains(taskL, "request") ||
+		strings.Contains(taskL, "model") || strings.Contains(taskL, "binding") {
+		layers = append(layers, "DTO/request")
+	}
+	if strings.Contains(taskL, "service") || strings.Contains(taskL, "logic") ||
+		strings.Contains(taskL, "auth") || strings.Contains(taskL, "login") {
+		layers = append(layers, "service")
+	}
+	if len(layers) == 0 {
+		layers = []string{"controller", "DTO/request"} // safe default
+	}
+
+	// Blast radius — narrow bugfix is always single-module
+	blast := "2 — single module (change is contained within " + target + ")"
+
+	// Risk assessment from keywords
+	var risks []string
+	if strings.Contains(taskL, "auth") || strings.Contains(taskL, "login") ||
+		strings.Contains(taskL, "credential") || strings.Contains(taskL, "token") {
+		risks = append(risks, "Auth layer touched — ensure no bypass of existing validation or middleware chain.")
+	}
+	if strings.Contains(taskL, "binding") || strings.Contains(taskL, "dto") ||
+		strings.Contains(taskL, "request") {
+		risks = append(risks, "Model binding — verify [Required] attributes and property names match JSON payload exactly.")
+	}
+	if strings.Contains(taskL, "400") || strings.Contains(taskL, "bad request") {
+		risks = append(risks, "400 Bad Request — likely model validation failure; check ModelState.IsValid is evaluated before service call.")
+	}
+	if len(risks) == 0 {
+		risks = []string{"Low risk — isolated change within single module, no DB or config involved."}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Deterministic architecture analysis (BUGFIX_NARROW — skipped LLM):\n\n")
+	sb.WriteString(fmt.Sprintf("Layers touched  : %s\n", strings.Join(layers, " → ")))
+	sb.WriteString(fmt.Sprintf("Blast radius    : %s\n", blast))
+	sb.WriteString("Dependencies    : controller → service (one call, no cascade side-effects expected)\n")
+	sb.WriteString("Critical risks  :\n")
+	for _, r := range risks {
+		sb.WriteString("  - " + r + "\n")
+	}
+
+	appendMeraLog("INFO", fmt.Sprintf("Deterministic architect used for BUGFIX_NARROW target=%s", target))
+	return AgentResult{
+		Agent:  "Architect",
+		Status: "completed",
+		Output: strings.TrimRight(sb.String(), "\n"),
+		Model:  "deterministic",
+	}
 }
 
 // fileScoutAgent identifies which specific files need to change using the confidence engine.
@@ -118,7 +243,7 @@ func fileScoutAgent(target, task string) AgentResult {
 		return scored[i].Confidence > scored[j].Confidence
 	})
 
-	// ── BUGFIX_NARROW: endpoint relationship analysis ─────────────────────
+	// ── BUGFIX_NARROW: endpoint relationship analysis ──────────────────────
 	// When the task is a narrow bug-fix (e.g. "Fix POST login 400 Bad Request"),
 	// read the top controller file and extract which DTOs and services are actually
 	// referenced by the target endpoint. Boost referenced files, penalise siblings.
@@ -139,6 +264,64 @@ func fileScoutAgent(target, task string) AgentResult {
 				break // use only the highest-confidence controller
 			}
 		}
+	}
+
+	// ── BUGFIX_NARROW: local-first fast path ─────────────────────────────────
+	// If the top local-scored file has confidence ≥70% the local engine is confident
+	// enough to produce a good selection without an Ollama round-trip. This eliminates
+	// the FileScout LLM call (typically 30-120s) for the common case where a clear
+	// controller/DTO pair dominates the score.
+	if scope == ScopeBugfixNarrow && len(scored) > 0 && scored[0].Confidence >= 70 {
+		fmt.Printf("[AGENT] File Scout: local confidence %d%% ≥70%% — BUGFIX_NARROW fast path (no Ollama).\n",
+			scored[0].Confidence)
+		appendMeraLog("INFO", fmt.Sprintf("File Scout local-first fast path: top confidence %d%% for %s",
+			scored[0].Confidence, target))
+
+		fe := sanitizeEvidence(scored)
+		if len(fe) > narrowFileLimit {
+			fe = fe[:narrowFileLimit]
+		}
+		fe = filterNoisyFilesForNarrowBugfix(fe)
+
+		var localVerified []FileEvidence
+		for _, ev := range fe {
+			if exists(ev.Path) {
+				localVerified = append(localVerified, ev)
+			}
+		}
+		localVerified = sanitizeEvidence(localVerified)
+
+		if len(localVerified) == 0 {
+			fmt.Println("[AGENT] File Scout: no verified files after local fast path.")
+			return buildScoutResult("degraded", "No resolvable files found.", nil)
+		}
+
+		// Collect rejected candidates for -ExplainSelection reporting.
+		selectedPaths := map[string]bool{}
+		for _, ev := range localVerified {
+			selectedPaths[ev.RelPath] = true
+		}
+		var localRejected []RejectedCandidate
+		for _, ev := range scored {
+			if selectedPaths[ev.RelPath] || ev.Confidence < 30 {
+				continue
+			}
+			localRejected = append(localRejected, RejectedCandidate{
+				RelPath: ev.RelPath,
+				Score:   ev.Confidence,
+				Reason:  rejectionReason(ev, scope, intent),
+			})
+			if len(localRejected) >= 6 {
+				break
+			}
+		}
+
+		fmt.Printf("[AGENT] File Scout identified %d file(s) (local-only fast path).\n", len(localVerified))
+		r := buildScoutResult("completed",
+			fmt.Sprintf("Identified %d file(s) — local confidence fast path (no LLM required).", len(localVerified)),
+			localVerified)
+		r.RejectedCandidates = localRejected
+		return r
 	}
 
 	// Send top 15 (by local score) to Ollama — keeps prompt small and within timeout.
@@ -176,7 +359,8 @@ func fileScoutAgent(target, task string) AgentResult {
 	}
 
 	// For BUGFIX_NARROW tasks, ask Ollama for fewer files — surgical selection.
-	const narrowFileLimit = 4
+	// Uses the package-level narrowFileLimit (3): controller + request DTO + service is
+	// sufficient. More files add noise and risk Aider context overflow → startup timeout.
 	maxFilesForPrompt := ps.MaxFiles
 	if scope == ScopeBugfixNarrow && maxFilesForPrompt > narrowFileLimit {
 		maxFilesForPrompt = narrowFileLimit
@@ -200,9 +384,18 @@ Return ONLY a JSON array of relative paths. Maximum %d files. No markdown, no ex
 Example: ["Identity/Controllers/AuthController.cs", "Identity/DTOs/LoginRequest.cs"]`,
 		p.Type, target, task, domainHint, hintsBlock, scopeHint, sb.String(), maxFilesForPrompt)
 
+	// Use capped timeout for BUGFIX_NARROW tasks that fell through local fast path
+	// (confidence <70%); prevents the 120s NORMAL FileScout timeout from blocking.
 	fmt.Println("[AGENT] File Scout querying Ollama...")
 	start := time.Now()
-	out, model, err := generateForRole(RoleFileScout, prompt, false)
+	var out, model string
+	var err error
+	if scope == ScopeBugfixNarrow {
+		ps := getProfileSettings()
+		out, model, err = generateForRoleCapped(RoleFileScout, prompt, false, ps.NarrowBugfixTimeout)
+	} else {
+		out, model, err = generateForRole(RoleFileScout, prompt, false)
+	}
 	elapsed := time.Since(start).Milliseconds()
 
 	var finalEvidence []FileEvidence
@@ -248,6 +441,14 @@ Example: ["Identity/Controllers/AuthController.cs", "Identity/DTOs/LoginRequest.
 		fmt.Printf("[AGENT] BUGFIX_NARROW: capped selection at %d files (profile allows %d).\n",
 			narrowFileLimit, effectiveFileLimit())
 		finalEvidence = finalEvidence[:narrowFileLimit]
+	}
+
+	// ── BUGFIX_NARROW: noise-file exclusion ───────────────────────────────
+	// Strip infrastructure/cross-cutting files that are almost never the root cause
+	// of a narrow functional bug (JWT internals, OpenAPI filters, schema examples, etc.)
+	// and that cause context overflow when fed to qwen2.5-coder:7b.
+	if scope == ScopeBugfixNarrow {
+		finalEvidence = filterNoisyFilesForNarrowBugfix(finalEvidence)
 	}
 
 	// Remove any entries whose absolute path no longer exists on disk.
@@ -299,6 +500,43 @@ Example: ["Identity/Controllers/AuthController.cs", "Identity/DTOs/LoginRequest.
 	return r
 }
 
+// filterNoisyFilesForNarrowBugfix removes infrastructure / cross-cutting files
+// that are almost never the root cause of a narrow functional bug but add context
+// weight that pushes small edit models (qwen2.5-coder:7b) past their effective window.
+//
+// Excluded by basename keyword (case-insensitive):
+//   - jwt*         — JWT token internals (signing, validation config)
+//   - *openapi*    — OpenAPI / Swagger document filters
+//   - *swagger*    — Swagger UI setup files
+//   - *schema*     — schema example / validator registrations
+//   - *filter*     — ASP.NET action filters, exception filters
+//   - *example*    — response-example providers
+//
+// These files are NOT excluded globally — only for BUGFIX_NARROW scope where
+// the 3-file cap already enforces surgical precision. Broader scopes (FULL,
+// NORMAL) still include them when their scores warrant it.
+func filterNoisyFilesForNarrowBugfix(in []FileEvidence) []FileEvidence {
+	noisyKeywords := []string{"jwt", "openapi", "swagger", "schema", "filter", "example"}
+	var out []FileEvidence
+	for _, ev := range in {
+		base := strings.ToLower(filepath.Base(ev.Path))
+		noisy := false
+		for _, kw := range noisyKeywords {
+			if strings.Contains(base, kw) {
+				noisy = true
+				break
+			}
+		}
+		if noisy {
+			fmt.Printf("[AGENT] BUGFIX_NARROW: dropped noisy file %s (infrastructure/cross-cutting)\n", ev.RelPath)
+			appendMeraLog("INFO", fmt.Sprintf("BUGFIX_NARROW noise filter dropped: %s", ev.RelPath))
+		} else {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
 // sanitizeEvidence removes any FileEvidence entry whose path matches isExcludedPath.
 // This is the last-resort filter — it fires regardless of how the path entered the list.
 // Every exit path from fileScoutAgent (success, degraded, fallback) must call this.
@@ -321,8 +559,35 @@ func sanitizeEvidence(in []FileEvidence) []FileEvidence {
 	return out
 }
 
-// securityAgent assesses risk via Ollama (streamed) + pattern scan.
+// securityAgent assesses risk via pattern scan + optional Ollama (streamed).
+//
+// BUGFIX_NARROW fast path: runs pattern scan first (instant). Only escalates to the LLM
+// when high-risk signals are present (payment, SQL/raw query, secrets, file/path/process APIs).
+// This eliminates the security LLM call (~30-90s) for low-risk narrow bugfixes like auth
+// endpoint model binding fixes where the pattern scan already provides sufficient coverage.
 func securityAgent(target, task string) AgentResult {
+	scope := classifyTaskScope(task)
+	patternRisks := patternSecurityScan(target, task)
+
+	if scope == ScopeBugfixNarrow {
+		if !requiresLLMSecurity(task, patternRisks) {
+			fmt.Println("[AGENT] Security: BUGFIX_NARROW fast path — pattern scan only (no high-risk signals).")
+			appendMeraLog("INFO", fmt.Sprintf("Security pattern-only fast path for BUGFIX_NARROW target=%s", target))
+			msg := "Pattern scan passed. No high-risk signals detected (payment/SQL/secrets/file-ops). Risk: LOW."
+			if len(patternRisks) > 0 {
+				msg = fmt.Sprintf("Pattern scan flagged %d item(s) — review risks below. No LLM escalation required.", len(patternRisks))
+			}
+			return AgentResult{
+				Agent:  "Security",
+				Status: "completed",
+				Output: msg,
+				Risks:  patternRisks,
+				Model:  "pattern-only",
+			}
+		}
+		fmt.Println("[AGENT] Security: high-risk signals detected — escalating to LLM for BUGFIX_NARROW.")
+	}
+
 	p := detectProject()
 	prompt := fmt.Sprintf(`You are a security reviewer for a software project.
 
@@ -338,11 +603,17 @@ Assess this change:
 
 4-6 lines. Be concise.`, p.Type, target, task)
 
-	fmt.Println("[AGENT] Security running...")
+	fmt.Println("[AGENT] Security running (LLM)...")
 	start := time.Now()
-	out, model, err := generateForRole(RoleSecurity, prompt, true)
+	var out, model string
+	var err error
+	if scope == ScopeBugfixNarrow {
+		ps := getProfileSettings()
+		out, model, err = generateForRoleCapped(RoleSecurity, prompt, true, ps.NarrowBugfixTimeout)
+	} else {
+		out, model, err = generateForRole(RoleSecurity, prompt, true)
+	}
 	elapsed := time.Since(start).Milliseconds()
-	patternRisks := patternSecurityScan(target, task)
 
 	if err != nil {
 		fmt.Println("[AGENT] Security degraded to pattern-only scan.")
@@ -351,6 +622,44 @@ Assess this change:
 	}
 	fmt.Println("[AGENT] Security done.")
 	return AgentResult{Agent: "Security", Status: "completed", Output: out, Risks: patternRisks, Model: model, DurationMs: elapsed}
+}
+
+// requiresLLMSecurity returns true when a BUGFIX_NARROW task contains high-risk signals
+// that justify an LLM security review beyond the pattern scan.
+//
+// Triggers:
+//   - Payment/billing keywords in task
+//   - SQL/raw query execution keywords
+//   - Secret/credential/environment variable manipulation
+//   - File system, path traversal, or process execution keywords
+//   - Pattern scan found injection-level findings (SQL injection, payment, credentials)
+func requiresLLMSecurity(task string, patternRisks []string) bool {
+	taskL := strings.ToLower(task)
+	highRiskKeywords := []string{
+		// Payment
+		"payment", "stripe", "paypal", "billing", "charge", "invoice",
+		// SQL / injection
+		"sql", "raw query", "execute", "exec(", "sp_",
+		// Secrets / config
+		"secret", "password", "credential", "appsettings", "env var", "connectionstring",
+		// File / process
+		"file upload", "upload", "download", "path traversal", "shell", "process",
+	}
+	for _, kw := range highRiskKeywords {
+		if strings.Contains(taskL, kw) {
+			return true
+		}
+	}
+	// Escalate if pattern scan found critical risk categories
+	for _, r := range patternRisks {
+		rL := strings.ToLower(r)
+		if strings.Contains(rL, "sql") || strings.Contains(rL, "injection") ||
+			strings.Contains(rL, "payment") || strings.Contains(rL, "secret") ||
+			strings.Contains(rL, "credential") {
+			return true
+		}
+	}
+	return false
 }
 
 // diffReviewAgent reads the current git diff and asks Ollama to review the changes.
@@ -405,15 +714,27 @@ func qaAgent(target, task string) AgentResult {
 	return AgentResult{Agent: "QA", Status: "completed", Output: strings.Join(cmds, " -> ")}
 }
 
-// reviewAgent summarizes the current diff and blast radius.
+// reviewAgent summarizes the actual git diff and blast radius.
+// Uses changedFiles() (git diff --name-only HEAD) so the count and file list
+// always reflect real tracked changes — never untracked or fabricated counts.
 func reviewAgent(target, task string) AgentResult {
 	fs := changedFiles()
 	br := blastRadius(fs)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Changed files: %d | Blast radius: %d\n", len(fs), br))
+	if len(fs) > 0 {
+		sb.WriteString("Files modified:\n")
+		for _, f := range fs {
+			sb.WriteString("  - " + f + "\n")
+		}
+	} else {
+		sb.WriteString("No tracked file changes detected (git diff HEAD is empty).\n")
+	}
 	fmt.Println("[AGENT] Review done.")
 	return AgentResult{
 		Agent:  "Review",
 		Status: "completed",
-		Output: fmt.Sprintf("Changed files: %d | Blast radius: %d", len(fs), br),
+		Output: strings.TrimRight(sb.String(), "\n"),
 		Files:  fs,
 	}
 }

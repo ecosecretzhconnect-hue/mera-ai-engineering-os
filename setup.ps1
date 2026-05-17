@@ -281,22 +281,22 @@ $PROFILE_ROUTER = @{
     Minimal = @{
         # All roles use the only available model on a Minimal install.
         planner = 'qwen2.5-coder:7b'; architect = 'qwen2.5-coder:7b'; filescout = 'qwen2.5-coder:7b'
-        code = 'qwen2.5-coder:7b'; diffreview = 'qwen2.5-coder:7b'
+        code = 'qwen2.5-coder:7b'; codeedit = 'qwen2.5-coder:7b'; diffreview = 'qwen2.5-coder:7b'
         security = 'qwen2.5-coder:7b'; sprintadvisor = 'qwen2.5-coder:7b'; meraProfile = 'FAST'
     }
     Fast = @{
         planner = 'phi4'; architect = 'llama3.1:8b'; filescout = 'phi4'
-        code = 'qwen2.5-coder:7b'; diffreview = 'llama3.1:8b'
+        code = 'qwen2.5-coder:7b'; codeedit = 'qwen2.5-coder:7b'; diffreview = 'llama3.1:8b'
         security = 'llama3.1:8b'; sprintadvisor = 'phi4'; meraProfile = 'FAST'
     }
     Balanced = @{
         planner = 'phi4'; architect = 'llama3.1:8b'; filescout = 'phi4'
-        code = 'qwen2.5-coder:14b'; diffreview = 'llama3.1:8b'
+        code = 'qwen2.5-coder:14b'; codeedit = 'qwen2.5-coder:7b'; diffreview = 'llama3.1:8b'
         security = 'llama3.1:8b'; sprintadvisor = 'phi4'; meraProfile = 'NORMAL'
     }
     Deep = @{
         planner = 'phi4'; architect = 'llama3.1:8b'; filescout = 'phi4'
-        code = 'qwen2.5-coder:14b'; diffreview = 'deepseek-coder-v2'
+        code = 'qwen2.5-coder:14b'; codeedit = 'qwen2.5-coder:7b'; diffreview = 'deepseek-coder-v2'
         security = 'llama3.1:8b'; sprintadvisor = 'phi4'; meraProfile = 'DEEP'
     }
 }
@@ -793,6 +793,7 @@ function Write-ModelsJson {
             architect     = $router.architect
             filescout     = $router.filescout
             code          = $router.code
+            codeedit      = $router.codeedit
             diffreview    = $router.diffreview
             security      = $router.security
             sprintadvisor = $router.sprintadvisor
