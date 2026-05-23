@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -10,10 +11,24 @@ import (
 )
 
 const (
-	maxFilesForAider       = 8
-	lowConfidenceThreshold = 40 // BLOCK if highest file is below this
-	midConfidenceThreshold = 60 // WARN if average is below this
+	maxFilesForAider           = 8
+	lowConfidenceThreshold     = 40 // BLOCK if highest file is below this
+	midConfidenceThreshold     = 60 // WARN if average is below this
+	targetModuleBoost          = 35 // Massive boost for files in target module directory (Phase 10.14)
+	unrelatedModulePenalty     = -30 // Severe penalty for files in unrelated modules (Phase 10.14)
+	exactSymbolMatchBoost      = 20 // Boost for exact filename match to symbol
+	exactClassDefinitionBoost  = 25 // Boost for exact class definition
+	exactMethodDefinitionBoost = 20 // Boost for exact method definition
 )
+
+// readFileContent reads a file's content safely, returning empty string on error.
+func readFileContent(absPath string) (string, error) {
+	data, err := ioutil.ReadFile(absPath)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
 
 // FileEvidence is the per-file result of the confidence engine.
 // Every file MERA selects must justify itself through this struct.
@@ -86,11 +101,18 @@ const (
 	ScopeGeneral      TaskScope = "GENERAL"        // Feature, refactor, or broad task
 )
 
-// classifyTaskScope returns BUGFIX_NARROW when the task targets a specific endpoint error.
-// Signals: task begins or contains "fix" AND includes an HTTP error code or HTTP method.
+// classifyTaskScope returns BUGFIX_NARROW when the task targets a specific, narrow bug.
+// Phase 10.14: Generic detection for any domain (not just HTTP endpoints).
+// Signals: task begins or contains "fix" AND includes specific indicators:
+//   - HTTP error (400, 404, 500) or error keyword
+//   - HTTP endpoint (POST, GET, PUT, PATCH, DELETE)
+//   - Specific method/class name (capitalized word like "Calculator" or "LoginRequest")
+//   - Generic bugfix keyword (null, nil, off-by-one, boundary, etc.)
 func classifyTaskScope(task string) TaskScope {
 	t := strings.ToLower(task)
 	isFix := strings.HasPrefix(t, "fix ") || strings.Contains(t, " fix ")
+
+	// HTTP-specific signals (auth, controllers, endpoints)
 	hasError := strings.Contains(t, "400") || strings.Contains(t, "404") ||
 		strings.Contains(t, "500") || strings.Contains(t, "bad request") ||
 		strings.Contains(t, "not found") || strings.Contains(t, "bug") ||
@@ -98,9 +120,20 @@ func classifyTaskScope(task string) TaskScope {
 	hasEndpoint := strings.Contains(t, "post ") || strings.Contains(t, "get ") ||
 		strings.Contains(t, " put ") || strings.Contains(t, "patch ") ||
 		strings.Contains(t, "delete ") || strings.Contains(t, "endpoint")
-	if isFix && (hasError || hasEndpoint) {
+
+	// Generic signals (Phase 10.14)
+	hasSpecificSymbols := len(extractSymbolsFromTask(task)) > 0 // "Fix Calculator Add method"
+	hasGenericBugKeyword := containsAny(t, genericBugfixKeywords) // "null", "nil", "off-by-one", etc.
+	hasMethodKeyword := containsAny(t, []string{"method", "function", "return"}) // "Fix X method/function"
+
+	// BUGFIX_NARROW triggers when:
+	// 1. HTTP-specific fix (existing logic), OR
+	// 2. Generic fix with specific symbols (Phase 10.14), OR
+	// 3. Generic fix with method/function keyword + bugfix keyword
+	if isFix && (hasError || hasEndpoint || (hasSpecificSymbols && hasMethodKeyword) || hasGenericBugKeyword) {
 		return ScopeBugfixNarrow
 	}
+
 	return ScopeGeneral
 }
 
@@ -269,6 +302,80 @@ func scoreFile(c candidateFile, target, task string) FileEvidence {
 	if fileNamePts > 0 {
 		score += fileNamePts
 		reasons = append(reasons, fmt.Sprintf("filename matches task keywords: %s", strings.Join(fileNameHits, ", ")))
+	}
+
+	// ── PHASE 10.14: Target module exact boost ────────────────────────────
+	// Massive boost when file is directly in target module directory
+	relSegments := strings.Split(filepath.ToSlash(rel), "/")
+	if len(relSegments) > 0 {
+		topLevel := strings.ToLower(relSegments[0])
+		targetVariants := moduleVariants(target)
+
+		for _, tv := range targetVariants {
+			tvBase := strings.ToLower(strings.Split(tv, ".")[0])
+			if strings.EqualFold(topLevel, tvBase) {
+				score += targetModuleBoost
+				reasons = append(reasons, fmt.Sprintf("file in target module directory (%s) (+%d)", target, targetModuleBoost))
+				break
+			}
+		}
+	}
+
+	// ── PHASE 10.14: Multi-symbol matching ────────────────────────────────
+	// Extract symbols from task (e.g., "Fix Calculator Add" → ["Calculator", "Add"])
+	// Boost files containing exact class/method definitions or matching symbol names
+	symbols := extractSymbolsFromTask(task)
+	if len(symbols) > 0 {
+		// Read file content for symbol analysis
+		var contentForSymbolMatch string
+		if content, err := readFileContent(c.absPath); err == nil {
+			contentForSymbolMatch = content
+		}
+
+		// Check for multi-symbol match: how many task symbols appear in filename/content?
+		if contentForSymbolMatch != "" {
+			symbolScore := scoreMultiSymbolMatch(contentForSymbolMatch, symbols)
+			if symbolScore > 0 {
+				score += symbolScore
+				symbolsFound := findAllSymbolsInContent(contentForSymbolMatch, symbols)
+				reasons = append(reasons, fmt.Sprintf("multi-symbol match: %d/%d symbols found (+%d)",
+					symbolsFound, len(symbols), symbolScore))
+			}
+
+			// Check for exact class/method definitions in file content
+			exactMatches := extractExactMatches(contentForSymbolMatch, symbols)
+			if len(exactMatches) > 0 {
+				score += exactClassDefinitionBoost
+				reasons = append(reasons, fmt.Sprintf("exact class/method definition: %s (+%d)",
+					strings.Join(exactMatches, ", "), exactClassDefinitionBoost))
+			}
+		}
+
+		// Check for exact symbol in filename (quick win)
+		for _, sym := range symbols {
+			if strings.Contains(nameLower, strings.ToLower(sym)) {
+				score += exactSymbolMatchBoost
+				reasons = append(reasons, fmt.Sprintf("exact symbol in filename: %s (+%d)", sym, exactSymbolMatchBoost))
+				break // Avoid double-counting
+			}
+		}
+	}
+
+	// ── PHASE 10.14: Unrelated module penalty ────────────────────────────
+	// Heavily penalize files in other business modules when target is specified
+	if len(relSegments) > 0 {
+		topLevel := strings.ToLower(relSegments[0])
+
+		// Common unrelated modules to penalize
+		unrelatedModules := []string{"admin", "finance", "audit", "logging", "infrastructure", "shared"}
+		for _, other := range unrelatedModules {
+			if strings.EqualFold(topLevel, other) && !isSameModule(other, target) {
+				score += unrelatedModulePenalty
+				reasons = append(reasons, fmt.Sprintf("file in unrelated module (%s) — not target (%s) (%d)",
+					other, target, unrelatedModulePenalty))
+				break
+			}
+		}
 	}
 
 	// ── Historical weighting (time-decayed) ──────────────────────────────

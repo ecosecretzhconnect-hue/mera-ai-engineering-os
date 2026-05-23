@@ -38,11 +38,16 @@ type candidateFile struct {
 // plannerAgent decomposes the task into concrete implementation steps.
 //
 // BUGFIX_NARROW fast path: returns a deterministic plan instantly without calling Ollama.
+// Phase 10.14: Uses generic intent classifier to support any domain (not just auth).
 // The LLM path is only used when the task scope is broader OR when --deep-plan is passed.
 // This eliminates the #1 source of pre-Aider latency (phi4 planning call, typically 60-180s).
 func plannerAgent(target, task string) AgentResult {
 	scope := classifyTaskScope(task)
 	if scope == ScopeBugfixNarrow && !deepPlanRequested() {
+		intent := classifyTaskIntentGeneric(task, target)
+		if intent == IntentSingleComponentFix {
+			return deterministicPlannerResultGeneric(target, task)
+		}
 		return deterministicPlannerResult(target, task)
 	}
 
@@ -113,11 +118,16 @@ func deterministicPlannerResult(target, task string) AgentResult {
 // architectAgent analyzes architectural impact.
 //
 // BUGFIX_NARROW fast path: returns a deterministic architectural summary derived from
-// task keywords without calling Ollama. Eliminates the architect LLM call (typically 60-120s).
+// task keywords without calling Ollama. Phase 10.14: Uses generic intent classifier for any domain.
+// Eliminates the architect LLM call (typically 60-120s).
 // DEEP/STRICT profiles trigger extended LLM analysis via DeeperArchitect setting.
 func architectAgent(target, task string) AgentResult {
 	scope := classifyTaskScope(task)
 	if scope == ScopeBugfixNarrow && !deepPlanRequested() {
+		intent := classifyTaskIntentGeneric(task, target)
+		if intent == IntentSingleComponentFix {
+			return deterministicArchitectResultGeneric(target, task)
+		}
 		return deterministicArchitectResult(target, task)
 	}
 
@@ -207,6 +217,127 @@ func deterministicArchitectResult(target, task string) AgentResult {
 	}
 
 	appendMeraLog("INFO", fmt.Sprintf("Deterministic architect used for BUGFIX_NARROW target=%s", target))
+	return AgentResult{
+		Agent:  "Architect",
+		Status: "completed",
+		Output: strings.TrimRight(sb.String(), "\n"),
+		Model:  "deterministic",
+	}
+}
+
+// ── PHASE 10.14: Generic Deterministic Planner & Architect ────────────────
+// Works for any domain (not just auth), based on task-driven symbol detection.
+
+// deterministicPlannerResultGeneric builds a generic plan for single-component bugfixes.
+// Analyzes task symbols (class/method names) to provide domain-agnostic steps.
+func deterministicPlannerResultGeneric(target, task string) AgentResult {
+	taskL := strings.ToLower(task)
+	fmt.Println("[AGENT] Planner: BUGFIX_NARROW fast path — deterministic plan (no LLM).")
+
+	symbols := extractSymbolsFromTask(task)
+
+	var sb strings.Builder
+	sb.WriteString("Deterministic plan (BUGFIX_NARROW — skipped LLM, use --deep-plan to enable):\n\n")
+
+	// Step 1: Locate target
+	if len(symbols) > 0 {
+		sb.WriteString(fmt.Sprintf("1. Locate target — Find %s in the identified file(s) (target: %s module)\n", symbols[0], target))
+	} else {
+		sb.WriteString("1. Locate target — Find the target class/method in the identified file(s)\n")
+	}
+
+	// Step 2: Understand inputs
+	sb.WriteString("2. Understand inputs — Review method/function signature, parameter types, and expected behavior\n")
+
+	// Step 3: Analyze root cause (varies by task keywords)
+	if containsAny(taskL, []string{"null", "nil", "undefined"}) {
+		sb.WriteString("3. Add guard — Check for null/nil reference before use; implement appropriate null-check or default handling\n")
+	} else if containsAny(taskL, []string{"calculation", "arithmetic", "math", "sum", "product", "return"}) {
+		sb.WriteString("3. Trace logic — Follow arithmetic step-by-step; verify operators, precedence, and return value\n")
+	} else if containsAny(taskL, []string{"condition", "if", "loop", "boundary", "off-by-one"}) {
+		sb.WriteString("3. Examine control flow — Review boolean condition logic and loop boundaries\n")
+	} else if containsAny(taskL, []string{"error", "exception", "fail"}) {
+		sb.WriteString("3. Identify error — Trace the failure path and pinpoint the line causing the error\n")
+	} else {
+		sb.WriteString("3. Analyze behavior — Understand current implementation and compare against expected behavior\n")
+	}
+
+	// Step 4: Apply fix
+	sb.WriteString("4. Apply minimal fix — One change per layer, smallest possible diff; do not refactor unrelated code\n")
+
+	// Step 5: Validate
+	sb.WriteString("5. Verify fix — Build/test, confirm behavior matches requirement, review git diff\n")
+
+	appendMeraLog("INFO", fmt.Sprintf("Generic deterministic planner used for BUGFIX_NARROW target=%s intent=SingleComponentFix", target))
+	return AgentResult{
+		Agent:  "Planner",
+		Status: "completed",
+		Output: sb.String(),
+		Model:  "deterministic",
+	}
+}
+
+// deterministicArchitectResultGeneric provides generic architectural analysis for single-component bugfixes.
+func deterministicArchitectResultGeneric(target, task string) AgentResult {
+	taskL := strings.ToLower(task)
+	fmt.Println("[AGENT] Architect: BUGFIX_NARROW fast path — deterministic analysis (no LLM).")
+
+	symbols := extractSymbolsFromTask(task)
+
+	// Identify likely layers based on symbols and keywords
+	var layers []string
+
+	// Heuristic: if method name suggests controller/endpoint, it's presentation
+	if len(symbols) > 0 {
+		firstSymbol := strings.ToLower(symbols[0])
+		if containsAny(firstSymbol, []string{"controller", "handler", "endpoint", "api", "service"}) {
+			layers = append(layers, "presentation/handler")
+		}
+	}
+
+	// Most method fixes are in logic/service layer
+	if len(symbols) > 0 {
+		layers = append(layers, "logic/method")
+	}
+
+	// If task mentions data/database/query, add data access
+	if containsAny(taskL, []string{"database", "query", "repository", "dao", "sql"}) {
+		layers = append(layers, "data-access")
+	}
+
+	if len(layers) == 0 {
+		layers = []string{"method-level"}
+	}
+
+	// Blast radius — narrow bugfix is always single-module
+	blast := "2 — single module (change is contained within " + target + ")"
+
+	// Generic risk assessment
+	var risks []string
+	if containsAny(taskL, []string{"null", "nil", "undefined"}) {
+		risks = append(risks, "Null-safety — ensure guard clause prevents downstream errors.")
+	}
+	if containsAny(taskL, []string{"calculation", "arithmetic", "math"}) {
+		risks = append(risks, "Logic correctness — verify operator precedence and boundary conditions.")
+	}
+	if containsAny(taskL, []string{"condition", "if", "loop"}) {
+		risks = append(risks, "Control flow — confirm boolean logic and loop termination.")
+	}
+	if len(risks) == 0 {
+		risks = []string{"Low risk — isolated change within single module, no cross-layer dependencies."}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Deterministic architecture analysis (BUGFIX_NARROW — skipped LLM):\n\n")
+	sb.WriteString(fmt.Sprintf("Layers touched  : %s\n", strings.Join(layers, " → ")))
+	sb.WriteString(fmt.Sprintf("Blast radius    : %s\n", blast))
+	sb.WriteString("Dependencies    : isolated method change, no cascade side-effects expected\n")
+	sb.WriteString("Critical risks  :\n")
+	for _, r := range risks {
+		sb.WriteString("  - " + r + "\n")
+	}
+
+	appendMeraLog("INFO", fmt.Sprintf("Generic deterministic architect used for BUGFIX_NARROW target=%s intent=SingleComponentFix", target))
 	return AgentResult{
 		Agent:  "Architect",
 		Status: "completed",
