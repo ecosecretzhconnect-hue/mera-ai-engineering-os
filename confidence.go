@@ -306,19 +306,13 @@ func scoreFile(c candidateFile, target, task string) FileEvidence {
 
 	// ── PHASE 10.14: Target module exact boost ────────────────────────────
 	// Massive boost when file is directly in target module directory
-	relSegments := strings.Split(filepath.ToSlash(rel), "/")
-	if len(relSegments) > 0 {
-		topLevel := strings.ToLower(relSegments[0])
-		targetVariants := moduleVariants(target)
+	// Uses simple top-level folder matching (generic, works for any project structure)
+	fileModule := topLevelModuleName(rel)
+	targetLowerModule := strings.ToLower(target)
 
-		for _, tv := range targetVariants {
-			tvBase := strings.ToLower(strings.Split(tv, ".")[0])
-			if strings.EqualFold(topLevel, tvBase) {
-				score += targetModuleBoost
-				reasons = append(reasons, fmt.Sprintf("file in target module directory (%s) (+%d)", target, targetModuleBoost))
-				break
-			}
-		}
+	if fileModule != "" && fileModule == targetLowerModule {
+		score += targetModuleBoost
+		reasons = append(reasons, fmt.Sprintf("file in target module directory (%s) (+%d)", target, targetModuleBoost))
 	}
 
 	// ── PHASE 10.14: Multi-symbol matching ────────────────────────────────
@@ -362,14 +356,12 @@ func scoreFile(c candidateFile, target, task string) FileEvidence {
 	}
 
 	// ── PHASE 10.14: Unrelated module penalty ────────────────────────────
-	// Heavily penalize files in other business modules when target is specified
-	if len(relSegments) > 0 {
-		topLevel := strings.ToLower(relSegments[0])
-
-		// Common unrelated modules to penalize
+	// Heavily penalize files in other modules when target is specified
+	if fileModule != "" && fileModule != targetLowerModule {
+		// Common unrelated modules that should be penalized
 		unrelatedModules := []string{"admin", "finance", "audit", "logging", "infrastructure", "shared"}
 		for _, other := range unrelatedModules {
-			if strings.EqualFold(topLevel, other) && !isSameModule(other, target) {
+			if fileModule == strings.ToLower(other) {
 				score += unrelatedModulePenalty
 				reasons = append(reasons, fmt.Sprintf("file in unrelated module (%s) — not target (%s) (%d)",
 					other, target, unrelatedModulePenalty))

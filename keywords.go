@@ -73,15 +73,26 @@ func containsSymbol(text, symbol string) bool {
 	return strings.Contains(strings.ToLower(text), strings.ToLower(symbol))
 }
 
-// extractTopLevelModule extracts the top-level module name from a relative path.
-// Example: "Admin/Controllers/UserController.cs" → "Admin"
-// Example: "MeraTest/Calculator.cs" → "MeraTest"
-func extractTopLevelModule(relPath string) string {
-	parts := strings.Split(strings.ToLower(strings.ReplaceAll(relPath, "\\", "/")), "/")
+// topLevelModuleName extracts the top-level module/folder name from a relative path.
+// Simple generic matching: works for any project structure.
+// Example: "MeraTest/Calculator.cs" → "meratest"
+// Example: "Admin/Controllers/UserController.cs" → "admin"
+// Example: "src/payment/service.go" → "src"
+func topLevelModuleName(relPath string) string {
+	// Normalize path separators and lowercase
+	normalized := strings.ToLower(strings.ReplaceAll(relPath, "\\", "/"))
+
+	// Split by forward slash and get first segment
+	parts := strings.Split(normalized, "/")
 	if len(parts) > 0 && parts[0] != "" {
 		return parts[0]
 	}
 	return ""
+}
+
+// extractTopLevelModule (deprecated) — use topLevelModuleName instead
+func extractTopLevelModule(relPath string) string {
+	return topLevelModuleName(relPath)
 }
 
 // isSameModule checks if two module names refer to the same module.
