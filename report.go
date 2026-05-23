@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,18 +11,31 @@ import (
 	"time"
 )
 
+// codePhase outcome constants — written to WorkflowReport.ChangeStatus.
+const (
+	codePhaseSuccess  = "success"   // Aider ran, files changed, validation ran
+	codePhaseNoChange = "no_change" // Aider ran cleanly but produced zero file changes
+	codePhaseFailed   = "failed"    // Aider exited with a non-timeout error
+	codePhaseTimeout  = "timeout"   // Watchdog killed Aider after silence period
+)
+
 type WorkflowReport struct {
-	SessionID   string          `json:"sessionId,omitempty"`
-	Task        string          `json:"task"`
-	Target      string          `json:"target"`
-	Mode        string          `json:"mode"`
-	Version     string          `json:"version"`
-	StartedAt   string          `json:"startedAt"`
-	CompletedAt string          `json:"completedAt"`
-	Agents      []AgentResult   `json:"agents"`
-	Validation  map[string]bool `json:"validation"`
-	Next        []string        `json:"next"`
-	Patch       *PatchAnalysis  `json:"patch,omitempty"`
+	SessionID      string          `json:"sessionId,omitempty"`
+	Task           string          `json:"task"`
+	Target         string          `json:"target"`
+	Mode           string          `json:"mode"`
+	Version        string          `json:"version"`
+	StartedAt      string          `json:"startedAt"`
+	CompletedAt    string          `json:"completedAt"`
+	Agents         []AgentResult   `json:"agents"`
+	Validation     map[string]bool `json:"validation"`
+	Next           []string        `json:"next"`
+	Patch          *PatchAnalysis  `json:"patch,omitempty"`
+	// Code phase integrity fields (Issue 5)
+	FilesChanged   []string `json:"filesChanged"`   // actual git diff --name-only HEAD
+	ChangeStatus   string   `json:"changeStatus"`   // success / no_change / failed / timeout
+	TimeoutOccurred bool    `json:"timeoutOccurred"` // true when watchdog killed Aider
+	AiderExitCode  int      `json:"aiderExitCode"`  // raw process exit code (0 = clean exit)
 }
 
 func runDoctor() {
@@ -201,50 +215,141 @@ func orchestrate(target, task, mode string, mayCode bool) error {
 
 	sessionBeginPhase("Code (Aider)")
 	aiderErr := runAider(mode, target, task, mode, true, approvedPaths, analysisAgents)
-	codeStatus, codeOut := "completed", "Aider session completed."
-	if aiderErr != nil {
-		codeStatus = "failed"
-		codeOut = aiderErr.Error()
-	}
-	sessionEndPhase("Code (Aider)", codeStatus, modelForRole(RoleCode))
-	rep.Agents = append(rep.Agents, AgentResult{Agent: "Code Agent", Status: codeStatus, Output: codeOut})
 
-	// ── Patch safety gate ────────────────────────────────────────────────────
-	if codeStatus == "completed" && len(changedFiles()) > 0 {
-		fmt.Println("\n[MERA] ========================================")
-		fmt.Println("[MERA] Running patch safety analysis...")
-		sessionBeginPhase("Patch Safety")
-		patch := analyzeDiff(target, task, approvedPaths)
-		rep.Patch = &patch
-		if patchErr := enforcePatchSafety(&patch); patchErr != nil {
-			sessionEndPhase("Patch Safety", "blocked", "")
-			rep.Next = append(rep.Next, "Patch safety blocked: "+patchErr.Error())
-			rep.Next = append(rep.Next, "Run: mera -Rollback to undo changes.")
-			rep.CompletedAt = time.Now().Format(time.RFC3339)
-			writeReport(rep, "workflow")
-			closeSession("Patch safety blocked: " + patchErr.Error())
-			return patchErr
+	// ── Determine outcome status (Issues 2 & 3) ──────────────────────────
+	// Precedence: timeout > failed > no_change > success.
+	// Only call changedFiles() once — single source of truth for the whole workflow.
+	changed := changedFiles()
+	rep.FilesChanged = changed
+
+	isTimeout := errors.Is(aiderErr, ErrAiderSilenceTimeout)
+	isBlocked := errors.Is(aiderErr, ErrAiderBlocked)
+	rep.TimeoutOccurred = isTimeout
+
+	var aiderExitCode int
+	var changeStatus string
+	var codeAgentOut string
+	switch {
+	case isBlocked:
+		// Phase 10.13: BLOCKED_INTERACTIVE is a distinct failure mode.
+		// Aider was alive and producing output but waiting for stdin input
+		// that will never arrive in headless mode. This is a configuration
+		// problem (missing --message / --yes flags), not a model timeout.
+		changeStatus = codePhaseFailed
+		codeAgentOut = "Aider blocked on an interactive prompt (BLOCKED_INTERACTIVE). " +
+			"Check .mera/logs/aider-session.log for the blocking line. " +
+			"Run: mera -AiderSmoke to diagnose headless mode."
+	case isTimeout:
+		changeStatus = codePhaseTimeout
+		codeAgentOut = "Aider watchdog terminated after 120s of silence."
+	case aiderErr != nil:
+		changeStatus = codePhaseFailed
+		codeAgentOut = aiderErr.Error()
+		// Attempt to extract process exit code from exec.ExitError.
+		var exitErr interface{ ExitCode() int }
+		if errors.As(aiderErr, &exitErr) {
+			aiderExitCode = exitErr.ExitCode()
+		} else {
+			aiderExitCode = -1
 		}
-		sessionEndPhase("Patch Safety", "passed", "")
+	case len(changed) == 0:
+		changeStatus = codePhaseNoChange
+		codeAgentOut = "Aider exited cleanly but produced no file changes."
+	default:
+		changeStatus = codePhaseSuccess
+		codeAgentOut = fmt.Sprintf("Aider completed — %d file(s) changed.", len(changed))
+	}
+	rep.ChangeStatus = changeStatus
+	rep.AiderExitCode = aiderExitCode
+
+	sessionEndPhase("Code (Aider)", changeStatus, modelForRole(RoleCode))
+	rep.Agents = append(rep.Agents, AgentResult{
+		Agent:  "Code Agent",
+		Status: changeStatus,
+		Output: codeAgentOut,
+		Files:  changed,
+	})
+
+	// ── Patch evidence (Issues 1 & 7) ────────────────────────────────────
+	// Always print what changed (or didn't) so the terminal is never ambiguous.
+	fmt.Println("\n[MERA] ========================================")
+	switch changeStatus {
+	case codePhaseSuccess:
+		fmt.Printf("[MERA] Modified files (%d):\n", len(changed))
+		for _, f := range changed {
+			fmt.Println("  -", f)
+		}
+	case codePhaseNoChange:
+		fmt.Println("[FAIL] No code changes were produced by Aider.")
+		fmt.Println("[MERA] Possible causes:")
+		fmt.Println("       - Task description too vague or model misunderstood context")
+		fmt.Println("       - Aider made edits but then reverted them")
+		fmt.Println("       - The change may already be implemented")
+		fmt.Println("[MERA] Try:")
+		fmt.Println("       mera -Plan <module> \"task\"   # re-analyze and refine")
+		fmt.Println("       mera -Code <module> \"more specific task description\"")
+	case codePhaseTimeout:
+		fmt.Println("[FAIL] Code phase timed out — watchdog killed Aider.")
+		fmt.Println("[MERA] Retry options:")
+		fmt.Println("       mera -Replay                 # same context, fresh session")
+		fmt.Println("       mera -Fast <module> \"task\"   # smaller model, faster response")
+	case codePhaseFailed:
+		if isBlocked {
+			fmt.Println("[FAIL] BLOCKED_INTERACTIVE — Aider halted waiting for user input in headless mode.")
+			fmt.Println("[MERA] This is a pipeline configuration error, not a model failure.")
+			fmt.Println("[MERA] Diagnosis:")
+			fmt.Printf("[MERA]   Log: %s\n", aiderLogPath())
+			fmt.Println("[MERA]   Run: mera -AiderSmoke   # verify headless pipeline end-to-end")
+		} else {
+			fmt.Println("[FAIL] Aider exited with an error:", codeAgentOut)
+		}
 	}
 
-	// ── Diff review + verdict enforcement ───────────────────────────────
-	if codeStatus == "completed" && len(changedFiles()) > 0 {
-		fmt.Println("\n[MERA] ========================================")
-		sessionBeginPhase("Diff Review")
-		diffReview := diffReviewAgent(target, task)
-		sessionEndPhase("Diff Review", diffReview.Status, diffReview.Model)
-		rep.Agents = append(rep.Agents, diffReview)
-		printAgentSummary(diffReview)
-
-		if err := enforceVerdict(diffReview); err != nil {
-			rep.Next = append(rep.Next, "Diff verdict blocked validation: "+err.Error())
-			rep.Next = append(rep.Next, "Run: mera -Rollback to undo changes.")
-			rep.CompletedAt = time.Now().Format(time.RFC3339)
-			writeReport(rep, "workflow")
-			closeSession("Diff verdict blocked: " + err.Error())
-			return err
+	// For anything other than a successful change, record and exit now.
+	// Do NOT run validation, patch safety, or diff review — that would be false success.
+	if changeStatus != codePhaseSuccess {
+		rep.Next = append(rep.Next, fmt.Sprintf("Code phase outcome: %s — no validation run.", changeStatus))
+		rep.CompletedAt = time.Now().Format(time.RFC3339)
+		writeReport(rep, "workflow")
+		closeSession("Code phase " + changeStatus)
+		if changeStatus == codePhaseNoChange {
+			return fmt.Errorf("code phase produced no changes — task may need refinement")
 		}
+		return aiderErr
+	}
+
+	// ── Patch safety gate (only reached on codePhaseSuccess) ─────────────
+	fmt.Println("\n[MERA] ========================================")
+	fmt.Println("[MERA] Running patch safety analysis...")
+	sessionBeginPhase("Patch Safety")
+	patch := analyzeDiff(target, task, approvedPaths)
+	rep.Patch = &patch
+	if patchErr := enforcePatchSafety(&patch); patchErr != nil {
+		sessionEndPhase("Patch Safety", "blocked", "")
+		rep.Next = append(rep.Next, "Patch safety blocked: "+patchErr.Error())
+		rep.Next = append(rep.Next, "Run: mera -Rollback to undo changes.")
+		rep.CompletedAt = time.Now().Format(time.RFC3339)
+		writeReport(rep, "workflow")
+		closeSession("Patch safety blocked: " + patchErr.Error())
+		return patchErr
+	}
+	sessionEndPhase("Patch Safety", "passed", "")
+
+	// ── Diff review + verdict enforcement ────────────────────────────────
+	fmt.Println("\n[MERA] ========================================")
+	sessionBeginPhase("Diff Review")
+	diffReview := diffReviewAgent(target, task)
+	sessionEndPhase("Diff Review", diffReview.Status, diffReview.Model)
+	rep.Agents = append(rep.Agents, diffReview)
+	printAgentSummary(diffReview)
+
+	if err := enforceVerdict(diffReview); err != nil {
+		rep.Next = append(rep.Next, "Diff verdict blocked validation: "+err.Error())
+		rep.Next = append(rep.Next, "Run: mera -Rollback to undo changes.")
+		rep.CompletedAt = time.Now().Format(time.RFC3339)
+		writeReport(rep, "workflow")
+		closeSession("Diff verdict blocked: " + err.Error())
+		return err
 	}
 
 	// ── Post-code agents ─────────────────────────────────────────────────
@@ -256,21 +361,16 @@ func orchestrate(target, task, mode string, mayCode bool) error {
 	printAgentSummary(review)
 
 	// ── Validation phase ─────────────────────────────────────────────────
-	changed := changedFiles()
 	validationPassed := false
 	verdict := extractVerdictFromAgents(rep.Agents)
 
-	if len(changed) > 0 {
-		fmt.Println("\n[MERA] ========================================")
-		fmt.Println("[MERA] Running validation pipeline...")
-		validationPassed = runValidation(target, &rep)
-		if validationPassed {
-			rep.Next = append(rep.Next, "All validation passed. Review diff with `git diff`, smoke test, then commit manually.")
-		} else {
-			rep.Next = append(rep.Next, "Validation failed. Fix errors before committing.")
-		}
+	fmt.Println("\n[MERA] ========================================")
+	fmt.Println("[MERA] Running validation pipeline...")
+	validationPassed = runValidation(target, &rep)
+	if validationPassed {
+		rep.Next = append(rep.Next, "All validation passed. Review diff with `git diff`, smoke test, then commit manually.")
 	} else {
-		rep.Next = append(rep.Next, "No files changed. Refine task or use -Code to implement changes.")
+		rep.Next = append(rep.Next, "Validation failed. Fix errors before committing.")
 	}
 
 	// ── Record outcome in project memory ─────────────────────────────────

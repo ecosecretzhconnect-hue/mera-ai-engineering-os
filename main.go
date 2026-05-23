@@ -150,6 +150,10 @@ func main() {
 		must(initProject())
 		must(smokeTestAuth())
 		must(runSmokeTest())
+	case "-aidersmoke", "aidersmoke":
+		must(initProject())
+		must(auth())
+		must(runAiderSmoke())
 	case "-replay", "replay":
 		must(initProject())
 		id := arg(2, "")
@@ -176,7 +180,7 @@ func main() {
 
 func usage() {
 	fmt.Println(Version)
-	fmt.Println("Commands: -Doctor -Init -Scan -Fingerprint -Profile -ExplainSelection -ExplainDiff -DryRun -Plan -Analyze -Code -Fast -Deep -Orchestrate -Validate -Snapshot -Rollback -BoundaryCheck -BlastRadius -Mission -Models -SetModel -SetProfile -ProfileMode -Diag -Health -Logs -Version -SmokeTest -Replay -Sessions")
+	fmt.Println("Commands: -Doctor -Init -Scan -Fingerprint -Profile -ExplainSelection -ExplainDiff -DryRun -Plan -Analyze -Code -Fast -Deep -Orchestrate -Validate -Snapshot -Rollback -BoundaryCheck -BlastRadius -Mission -Models -SetModel -SetProfile -ProfileMode -Diag -Health -Logs -Version -SmokeTest -AiderSmoke -Replay -Sessions")
 }
 
 func must(e error) {
@@ -209,4 +213,15 @@ func joinOrPrompt(i int, label string) string {
 		return promptLine(label)
 	}
 	return s
+}
+
+// deepPlanRequested returns true when the user passes --deep-plan on the command line.
+// This opts out of the BUGFIX_NARROW deterministic planner and forces a full LLM plan.
+func deepPlanRequested() bool {
+	for _, a := range os.Args {
+		if strings.EqualFold(a, "--deep-plan") {
+			return true
+		}
+	}
+	return false
 }

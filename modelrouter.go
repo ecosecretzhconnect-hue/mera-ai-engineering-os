@@ -19,6 +19,12 @@ const (
 	RoleArchitect     = "architect"
 	RoleFileScout     = "filescout"
 	RoleCode          = "code"
+	// RoleCodeEdit is the model used by Aider for the actual edit step.
+	// Intentionally separated from RoleCode so a faster / more reliable
+	// code-edit model (e.g. qwen2.5-coder:7b) can be assigned while keeping
+	// a larger analytical model for FileScout and planning roles.
+	// Falls back to RoleCode when not explicitly configured.
+	RoleCodeEdit      = "codeedit"
 	RoleDiffReview    = "diffreview"
 	RoleSecurity      = "security"
 	RoleSprintAdvisor = "sprintadvisor"
@@ -57,6 +63,7 @@ func defaultModelConfig() ModelConfig {
 			RoleArchitect:     "llama3.1:8b",
 			RoleFileScout:     "phi4",
 			RoleCode:          "qwen2.5-coder:14b",
+			RoleCodeEdit:      "qwen2.5-coder:7b", // fast, reliable Aider edit model
 			RoleDiffReview:    "deepseek-coder-v2",
 			RoleSecurity:      "llama3.1:8b",
 			RoleSprintAdvisor: "phi4",
@@ -74,7 +81,7 @@ func safeDefaultModelConfig() ModelConfig {
 		Profile:       ProfileFast,
 		Models: map[string]string{
 			RolePlanner: m, RoleArchitect: m, RoleFileScout: m,
-			RoleCode: m, RoleDiffReview: m, RoleSecurity: m, RoleSprintAdvisor: m,
+			RoleCode: m, RoleCodeEdit: m, RoleDiffReview: m, RoleSecurity: m, RoleSprintAdvisor: m,
 		},
 	}
 }
@@ -111,6 +118,10 @@ func loadModelConfig() ModelConfig {
 
 	// Fill any missing roles using the most-common model already in the config.
 	// This preserves the user's profile intent instead of injecting arbitrary defaults.
+	// Special case: RoleCodeEdit always falls back to "qwen2.5-coder:7b" (not the primary
+	// model) because it is specifically the fast/reliable Aider edit model — using a large
+	// analytical model here defeats its purpose and was the source of a latency regression
+	// when older models.json files were migrated without the codeedit key.
 	primaryModel := "qwen2.5-coder:7b"
 	for _, m := range mc.Models {
 		if m != "" {
@@ -118,10 +129,17 @@ func loadModelConfig() ModelConfig {
 			break
 		}
 	}
-	allRoles := []string{RolePlanner, RoleArchitect, RoleFileScout, RoleCode, RoleDiffReview, RoleSecurity, RoleSprintAdvisor}
+	roleDefaults := map[string]string{
+		RoleCodeEdit: "qwen2.5-coder:7b", // always small + fast — never fall back to analytical model
+	}
+	allRoles := []string{RolePlanner, RoleArchitect, RoleFileScout, RoleCode, RoleCodeEdit, RoleDiffReview, RoleSecurity, RoleSprintAdvisor}
 	for _, role := range allRoles {
 		if mc.Models[role] == "" {
-			mc.Models[role] = primaryModel
+			if d, ok := roleDefaults[role]; ok {
+				mc.Models[role] = d
+			} else {
+				mc.Models[role] = primaryModel
+			}
 		}
 	}
 
@@ -153,61 +171,66 @@ func saveModelConfig(mc ModelConfig) error {
 
 // ProfileSettings drives timeouts, context depth, and agent policy for a given profile.
 type ProfileSettings struct {
-	AgentTimeout      time.Duration // non-streaming Ollama calls (intent score, etc.)
-	FileScoutTimeout  time.Duration // File Scout specifically — shorter to avoid 120s hangs
-	StreamTimeout     time.Duration // streaming Ollama calls (Planner, Architect, etc.)
-	MaxFiles          int           // max files passed to Aider
-	MaxFileLines      int           // max lines injected per file in session document
-	SkipSprint        bool          // skip sprint suggestions for speed
-	ExtraGating       bool          // STRICT: additional acknowledgement before code phase
-	DeeperArchitect   bool          // DEEP/STRICT: extended architect analysis prompt
+	AgentTimeout        time.Duration // non-streaming Ollama calls (intent score, etc.)
+	FileScoutTimeout    time.Duration // File Scout specifically — shorter to avoid 120s hangs
+	StreamTimeout       time.Duration // streaming Ollama calls (Planner, Architect, etc.)
+	NarrowBugfixTimeout time.Duration // hard cap on any Ollama call during BUGFIX_NARROW fast path
+	MaxFiles            int           // max files passed to Aider
+	MaxFileLines        int           // max lines injected per file in session document
+	SkipSprint          bool          // skip sprint suggestions for speed
+	ExtraGating         bool          // STRICT: additional acknowledgement before code phase
+	DeeperArchitect     bool          // DEEP/STRICT: extended architect analysis prompt
 }
 
 func profileSettings(p PerformanceProfile) ProfileSettings {
 	switch p {
 	case ProfileFast:
 		return ProfileSettings{
-			AgentTimeout:    60 * time.Second,
-			FileScoutTimeout: 45 * time.Second, // hard cap: never hang 120s in FAST
-			StreamTimeout:   30 * time.Second,
-			MaxFiles:        3,
-			MaxFileLines:    60,
-			SkipSprint:      true,
-			ExtraGating:     false,
-			DeeperArchitect: false,
+			AgentTimeout:        60 * time.Second,
+			FileScoutTimeout:    45 * time.Second, // hard cap: never hang 120s in FAST
+			StreamTimeout:       30 * time.Second,
+			NarrowBugfixTimeout: 30 * time.Second, // FAST already capped; apply same
+			MaxFiles:            3,
+			MaxFileLines:        60,
+			SkipSprint:          true,
+			ExtraGating:         false,
+			DeeperArchitect:     false,
 		}
 	case ProfileDeep:
 		return ProfileSettings{
-			AgentTimeout:    300 * time.Second,
-			FileScoutTimeout: 300 * time.Second,
-			StreamTimeout:   180 * time.Second,
-			MaxFiles:        8,
-			MaxFileLines:    200,
-			SkipSprint:      false,
-			ExtraGating:     false,
-			DeeperArchitect: true,
+			AgentTimeout:        300 * time.Second,
+			FileScoutTimeout:    300 * time.Second,
+			StreamTimeout:       180 * time.Second,
+			NarrowBugfixTimeout: 90 * time.Second, // deeper analysis allowed in DEEP
+			MaxFiles:            8,
+			MaxFileLines:        200,
+			SkipSprint:          false,
+			ExtraGating:         false,
+			DeeperArchitect:     true,
 		}
 	case ProfileStrict:
 		return ProfileSettings{
-			AgentTimeout:    300 * time.Second,
-			FileScoutTimeout: 300 * time.Second,
-			StreamTimeout:   180 * time.Second,
-			MaxFiles:        8,
-			MaxFileLines:    150,
-			SkipSprint:      false,
-			ExtraGating:     true,
-			DeeperArchitect: true,
+			AgentTimeout:        300 * time.Second,
+			FileScoutTimeout:    300 * time.Second,
+			StreamTimeout:       180 * time.Second,
+			NarrowBugfixTimeout: 90 * time.Second,
+			MaxFiles:            8,
+			MaxFileLines:        150,
+			SkipSprint:          false,
+			ExtraGating:         true,
+			DeeperArchitect:     true,
 		}
 	default: // NORMAL
 		return ProfileSettings{
-			AgentTimeout:    120 * time.Second,
-			FileScoutTimeout: 120 * time.Second,
-			StreamTimeout:   90 * time.Second,
-			MaxFiles:        6,
-			MaxFileLines:    120,
-			SkipSprint:      false,
-			ExtraGating:     false,
-			DeeperArchitect: false,
+			AgentTimeout:        120 * time.Second,
+			FileScoutTimeout:    120 * time.Second,
+			StreamTimeout:       90 * time.Second,
+			NarrowBugfixTimeout: 45 * time.Second, // hard cap: no NORMAL agent blocks >45s for narrow bugfix
+			MaxFiles:            6,
+			MaxFileLines:        120,
+			SkipSprint:          false,
+			ExtraGating:         false,
+			DeeperArchitect:     false,
 		}
 	}
 }
@@ -346,6 +369,32 @@ func generateForRole(role, prompt string, stream bool) (string, string, error) {
 	return out, model, err
 }
 
+// generateForRoleCapped is identical to generateForRole but enforces a hard maximum timeout.
+// Used for BUGFIX_NARROW tasks where no analysis agent should block longer than
+// NarrowBugfixTimeout regardless of the active profile.
+// If maxTimeout is 0 the cap is ignored and profileTimeout wins.
+func generateForRoleCapped(role, prompt string, stream bool, maxTimeout time.Duration) (string, string, error) {
+	model := modelForRole(role)
+	ps := getProfileSettings()
+	var baseTimeout time.Duration
+	switch {
+	case stream:
+		baseTimeout = ps.StreamTimeout
+	case role == RoleFileScout:
+		baseTimeout = ps.FileScoutTimeout
+	default:
+		baseTimeout = ps.AgentTimeout
+	}
+	timeout := baseTimeout
+	if maxTimeout > 0 && maxTimeout < baseTimeout {
+		timeout = maxTimeout
+		fmt.Printf("[MERA] %s timeout capped at %s for BUGFIX_NARROW (profile: %s)\n",
+			role, maxTimeout.Round(time.Second), activeProfile())
+	}
+	out, err := defaultProvider.Generate(model, prompt, stream, timeout)
+	return out, model, err
+}
+
 // modelModeLabel returns a human-readable label describing the model configuration mode.
 // "Single-model fallback" is printed when all roles share one model (e.g. Minimal install).
 func modelModeLabel(mc ModelConfig) string {
@@ -385,7 +434,7 @@ func checkModelsForDoctor() {
 	}
 
 	fmt.Printf("  Active profile: %s\n", mc.Profile)
-	roles := []string{RolePlanner, RoleArchitect, RoleFileScout, RoleCode, RoleDiffReview, RoleSecurity, RoleSprintAdvisor}
+	roles := []string{RolePlanner, RoleArchitect, RoleFileScout, RoleCode, RoleCodeEdit, RoleDiffReview, RoleSecurity, RoleSprintAdvisor}
 
 	seen := map[string]bool{}
 	var missingUniq []string
@@ -436,7 +485,7 @@ func printModels() {
 	fmt.Println("[MERA] ========================================")
 	fmt.Printf("  Active profile: %s\n\n", mc.Profile)
 
-	roles := []string{RolePlanner, RoleArchitect, RoleFileScout, RoleCode, RoleDiffReview, RoleSecurity, RoleSprintAdvisor}
+	roles := []string{RolePlanner, RoleArchitect, RoleFileScout, RoleCode, RoleCodeEdit, RoleDiffReview, RoleSecurity, RoleSprintAdvisor}
 	for _, role := range roles {
 		model := mc.Models[role]
 		ml := strings.ToLower(model)
@@ -473,10 +522,10 @@ func setModelForRole(role, model string) error {
 	role = strings.ToLower(strings.TrimSpace(role))
 	validRoles := map[string]bool{
 		RolePlanner: true, RoleArchitect: true, RoleFileScout: true,
-		RoleCode: true, RoleDiffReview: true, RoleSecurity: true, RoleSprintAdvisor: true,
+		RoleCode: true, RoleCodeEdit: true, RoleDiffReview: true, RoleSecurity: true, RoleSprintAdvisor: true,
 	}
 	if !validRoles[role] {
-		return fmt.Errorf("unknown role %q\nValid roles: planner, architect, filescout, code, diffreview, security, sprintadvisor", role)
+		return fmt.Errorf("unknown role %q\nValid roles: planner, architect, filescout, code, codeedit, diffreview, security, sprintadvisor", role)
 	}
 
 	mc := loadModelConfig()
