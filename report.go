@@ -223,12 +223,22 @@ func orchestrate(target, task, mode string, mayCode bool) error {
 	rep.FilesChanged = changed
 
 	isTimeout := errors.Is(aiderErr, ErrAiderSilenceTimeout)
+	isBlocked := errors.Is(aiderErr, ErrAiderBlocked)
 	rep.TimeoutOccurred = isTimeout
 
 	var aiderExitCode int
 	var changeStatus string
 	var codeAgentOut string
 	switch {
+	case isBlocked:
+		// Phase 10.13: BLOCKED_INTERACTIVE is a distinct failure mode.
+		// Aider was alive and producing output but waiting for stdin input
+		// that will never arrive in headless mode. This is a configuration
+		// problem (missing --message / --yes flags), not a model timeout.
+		changeStatus = codePhaseFailed
+		codeAgentOut = "Aider blocked on an interactive prompt (BLOCKED_INTERACTIVE). " +
+			"Check .mera/logs/aider-session.log for the blocking line. " +
+			"Run: mera -AiderSmoke to diagnose headless mode."
 	case isTimeout:
 		changeStatus = codePhaseTimeout
 		codeAgentOut = "Aider watchdog terminated after 120s of silence."
@@ -284,7 +294,15 @@ func orchestrate(target, task, mode string, mayCode bool) error {
 		fmt.Println("       mera -Replay                 # same context, fresh session")
 		fmt.Println("       mera -Fast <module> \"task\"   # smaller model, faster response")
 	case codePhaseFailed:
-		fmt.Println("[FAIL] Aider exited with an error:", codeAgentOut)
+		if isBlocked {
+			fmt.Println("[FAIL] BLOCKED_INTERACTIVE — Aider halted waiting for user input in headless mode.")
+			fmt.Println("[MERA] This is a pipeline configuration error, not a model failure.")
+			fmt.Println("[MERA] Diagnosis:")
+			fmt.Printf("[MERA]   Log: %s\n", aiderLogPath())
+			fmt.Println("[MERA]   Run: mera -AiderSmoke   # verify headless pipeline end-to-end")
+		} else {
+			fmt.Println("[FAIL] Aider exited with an error:", codeAgentOut)
+		}
 	}
 
 	// For anything other than a successful change, record and exit now.

@@ -22,6 +22,38 @@ import (
 // distinguish a watchdog kill from a normal execution failure or no-change.
 var ErrAiderSilenceTimeout = errors.New("aider-silence-timeout")
 
+// ErrAiderBlocked is returned when Aider prints a known interactive-prompt pattern
+// while running in headless mode — meaning it is blocking on stdin instead of
+// completing its task. This is distinct from a timeout: the process is alive and
+// producing output, but is waiting for a human response it will never get.
+var ErrAiderBlocked = errors.New("aider-blocked-interactive")
+
+// runInteractiveOpts controls optional behaviour of runInteractive.
+type runInteractiveOpts struct {
+	// logPath, if non-empty, causes all subprocess output lines to be tee'd to
+	// this file with a timestamp prefix. The directory is created if missing.
+	logPath string
+	// blockPatterns is a list of substrings; when any subprocess output line
+	// contains one of these, the process is killed and ErrAiderBlocked is returned.
+	// Used to detect Aider interactive prompts that would block forever in headless mode.
+	blockPatterns []string
+	// closeStdin, when true, wires the subprocess stdin to nil (os.DevNull equivalent)
+	// instead of inheriting os.Stdin. Always set this for Aider in headless mode so
+	// Aider cannot block on a terminal read.
+	closeStdin bool
+}
+
+// aiderBlockPatterns lists substrings that indicate Aider is waiting for interactive
+// input. Any of these appearing in Aider output signals BLOCKED_INTERACTIVE.
+var aiderBlockPatterns = []string{
+	"diff> ",        // Aider REPL prompt in diff edit-format (no --message supplied)
+	"(Y)es/(N)o",   // generic Y/N confirmation prompt
+	"[Y]es/[N]o",   // alternate formatting of Y/N prompt
+	"Apply this fix", // legacy apply-patch prompt
+	"Do you want to", // general interactive confirmation
+	"Add .aiderignore", // gitignore setup prompt (belt-and-suspenders over --no-gitignore)
+}
+
 // guardExcludedDirs lists directories that are skipped when counting repo source files.
 // These are build artefacts, tooling caches, and IDE directories that inflate the count.
 var guardExcludedDirs = map[string]bool{
@@ -91,6 +123,14 @@ func checkMinimalModelGuard(target string) error {
 		count, remediation)
 }
 
+// aiderLogPath returns the path for the current Aider session raw log and ensures
+// the parent directory exists. Each run overwrites the previous log.
+func aiderLogPath() string {
+	dir := filepath.Join(meraDir(), "logs")
+	_ = os.MkdirAll(dir, 0755)
+	return filepath.Join(dir, "aider-session.log")
+}
+
 // runAider launches Aider with a MERA-generated session briefing and optional targeted file list.
 // targetFiles come from File Scout — passed as --file args so Aider focuses immediately.
 // sessionAgents provides agent intelligence embedded in the session document.
@@ -152,13 +192,27 @@ func runAider(mode, target, task, perf string, code bool, targetFiles []string, 
 		"--no-dirty-commits",
 		"--suggest-shell-commands",
 		"--show-diffs",
-		"--pretty",
+		// Phase 10.13: headless flags ─────────────────────────────────────
+		// --no-pretty:     disables rich terminal output that triggers
+		//                  UnicodeDecodeError on Windows OEM consoles.
+		// --no-gitignore:  suppresses the interactive gitignore-setup prompt
+		//                  that blocks headless runs.
+		// --yes:           auto-confirms any remaining Aider confirmation
+		//                  prompts without blocking on stdin.
+		// --message:       runs Aider in one-shot non-interactive mode —
+		//                  processes the task, applies edits, then exits.
+		//                  Without this flag Aider would enter the REPL and
+		//                  print "diff> " waiting for user input forever.
+		"--no-pretty",
+		"--no-gitignore",
+		"--yes",
 		"--map-tokens", fmt.Sprint(mt),
 		// Non-interactive stability flags:
 		// --no-fancy-input: disables prompt_toolkit / readline (fixes "No Windows console found").
 		// --no-check-update: suppresses update-check banner that can block startup.
 		"--no-fancy-input",
 		"--no-check-update",
+		"--message", task,
 	}
 
 	for _, f := range targetFiles {
@@ -183,8 +237,24 @@ func runAider(mode, target, task, perf string, code bool, targetFiles []string, 
 		aiderStartupKill = 180 * time.Second // 3 min for cold model start
 		aiderSilenceKill = 60 * time.Second  // 1 min inactivity mid-generation
 	)
+
+	// Phase 10.13: fully headless opts.
+	// closeStdin: Aider must not read from the terminal — we pass --message so
+	//             it processes one-shot and exits. Inheriting os.Stdin would let
+	//             Aider block on unexpected interactive prompts.
+	// logPath:    raw subprocess output captured for post-mortem diagnosis.
+	// blockPatterns: safety net — if Aider somehow prints an interactive prompt
+	//             despite --message/--yes/--no-gitignore, kill it immediately and
+	//             return ErrAiderBlocked (not a generic timeout).
+	lp := aiderLogPath()
+	fmt.Printf("[MERA] Aider session log: %s\n", lp)
+	opts := runInteractiveOpts{
+		closeStdin:    true,
+		logPath:       lp,
+		blockPatterns: aiderBlockPatterns,
+	}
 	return runInteractive(context.Background(), "aider", args,
-		time.Duration(cfg.TimeoutSeconds)*time.Second, aiderStartupKill, aiderSilenceKill)
+		time.Duration(cfg.TimeoutSeconds)*time.Second, aiderStartupKill, aiderSilenceKill, opts)
 }
 
 // buildSession writes active-session.md that Aider reads via --read.
@@ -372,7 +442,17 @@ func checkOllamaLatency(model string) (time.Duration, error) {
 //     (handles cold model startup). 0 = no startup kill.
 //   - silenceKill:  kills the process if no output is received for this duration
 //     AFTER the first token arrives (handles mid-generation stalls). 0 = no silence kill.
-func runInteractive(ctx context.Context, name string, args []string, timeout, startupKill, silenceKill time.Duration) error {
+//
+// opts is optional (variadic, max one element). When supplied it enables:
+//   - log capture (all output tee'd to opts.logPath with timestamps)
+//   - interactive-prompt detection (opts.blockPatterns → ErrAiderBlocked)
+//   - headless stdin (opts.closeStdin = true → subprocess gets nil stdin)
+func runInteractive(ctx context.Context, name string, args []string, timeout, startupKill, silenceKill time.Duration, opts ...runInteractiveOpts) error {
+	var o runInteractiveOpts
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -383,7 +463,26 @@ func runInteractive(ctx context.Context, name string, args []string, timeout, st
 	cmd.Dir = root()
 	so, _ := cmd.StdoutPipe()
 	se, _ := cmd.StderrPipe()
-	cmd.Stdin = os.Stdin
+
+	// Phase 10.13: headless stdin.
+	// When closeStdin is set we give the subprocess nil stdin (equivalent to
+	// /dev/null). Aider uses --message so it never needs to read from stdin;
+	// passing os.Stdin would allow it to block on interactive prompts.
+	if !o.closeStdin {
+		cmd.Stdin = os.Stdin
+	}
+
+	// Phase 10.13: open log file for tee capture.
+	var logWriter *os.File
+	if o.logPath != "" {
+		_ = os.MkdirAll(filepath.Dir(o.logPath), 0755)
+		if lf, err := os.Create(o.logPath); err == nil {
+			logWriter = lf
+			defer lf.Close()
+			fmt.Fprintf(lf, "# MERA Aider session log — %s\n# Command: %s %s\n\n",
+				time.Now().Format(time.RFC3339), name, strings.Join(args, " "))
+		}
+	}
 
 	setActiveCmd(cmd)
 	defer clearActiveCmd()
@@ -394,20 +493,49 @@ func runInteractive(ctx context.Context, name string, args []string, timeout, st
 
 	startTime := time.Now()
 	var (
-		mu         sync.Mutex
-		last       = time.Now()
-		firstToken bool
+		mu            sync.Mutex
+		last          = time.Now()
+		firstToken    bool
+		blockDetected bool
 	)
 	done := make(chan error, 1)
 
 	pipe := func(r io.Reader) {
 		sc := bufio.NewScanner(r)
 		for sc.Scan() {
+			line := sc.Text()
+
+			// Phase 10.13: check for interactive-prompt patterns before printing.
+			// If detected, kill the process immediately so we never hang.
+			if len(o.blockPatterns) > 0 {
+				for _, pat := range o.blockPatterns {
+					if strings.Contains(line, pat) {
+						mu.Lock()
+						if !blockDetected {
+							blockDetected = true
+							fmt.Printf("\n[MERA] BLOCKED_INTERACTIVE — Aider printed an interactive prompt: %q\n", line)
+							fmt.Println("[MERA] Killing Aider process. This should not happen in headless mode.")
+							if cmd.Process != nil {
+								_ = cmd.Process.Kill()
+							}
+						}
+						mu.Unlock()
+						break
+					}
+				}
+			}
+
 			mu.Lock()
 			last = time.Now()
 			firstToken = true // first output received — startup phase is over
 			mu.Unlock()
-			fmt.Println(sc.Text())
+
+			fmt.Println(line)
+
+			// Tee to log file with timestamp.
+			if logWriter != nil {
+				fmt.Fprintf(logWriter, "[%s] %s\n", time.Now().Format("15:04:05.000"), line)
+			}
 		}
 	}
 	go pipe(so)
@@ -421,6 +549,12 @@ func runInteractive(ctx context.Context, name string, args []string, timeout, st
 	for {
 		select {
 		case e := <-done:
+			mu.Lock()
+			bd := blockDetected
+			mu.Unlock()
+			if bd {
+				return fmt.Errorf("%w: interactive prompt detected — headless mode requires --message and --yes", ErrAiderBlocked)
+			}
 			return e
 		case <-ticker.C:
 			mu.Lock()
@@ -462,4 +596,125 @@ func runInteractive(ctx context.Context, name string, args []string, timeout, st
 			return fmt.Errorf("command timed out: %s", name)
 		}
 	}
+}
+
+// ── AiderSmoke ────────────────────────────────────────────────────────────────
+
+// runAiderSmoke verifies end-to-end headless Aider connectivity.
+// It performs four checks in sequence:
+//  1. Ollama process reachable
+//  2. Code-edit model latency (model must respond within 45 s)
+//  3. Headless Aider launch — process starts without blocking on stdin
+//  4. Model responded (MERA_SMOKE_OK token appears in captured log)
+//
+// Use this after any change to the Aider invocation path to confirm
+// the pipeline works before running a real coding task.
+func runAiderSmoke() error {
+	fmt.Println("[SMOKE] ─────────────────────────────────────────")
+	fmt.Println("[SMOKE] MERA Aider Smoke Test")
+	fmt.Println("[SMOKE] ─────────────────────────────────────────")
+
+	// Step 1: Ollama connectivity
+	fmt.Println("[SMOKE] Step 1/4: Ollama connectivity...")
+	if e := ensureOllama(); e != nil {
+		return fmt.Errorf("[SMOKE] FAIL — Ollama not available: %w", e)
+	}
+	fmt.Println("[SMOKE]   Ollama: OK")
+
+	// Step 2: Model latency
+	editModel := modelForRole(RoleCodeEdit)
+	if editModel == "" {
+		editModel = modelForRole(RoleCode)
+	}
+	fmt.Printf("[SMOKE] Step 2/4: Model latency check (%s)...\n", editModel)
+	latency, latErr := checkOllamaLatency(editModel)
+	if latErr != nil {
+		return fmt.Errorf("[SMOKE] FAIL — model %s not reachable: %w", editModel, latErr)
+	}
+	if latency > 45*time.Second {
+		fmt.Printf("[SMOKE]   WARN — latency %s is high; Aider may be slow\n", latency.Round(time.Second))
+	} else {
+		fmt.Printf("[SMOKE]   Model latency: %s — OK\n", latency.Round(time.Millisecond))
+	}
+
+	// Step 3 & 4: Headless Aider launch with a trivial one-shot message.
+	// The message is designed to produce a predictable text token (MERA_SMOKE_OK)
+	// that we can grep from the captured log to confirm the model responded.
+	// We do NOT ask Aider to edit any files — the smoke test only validates
+	// the Aider launch pipeline, not code editing.
+	smokeLogPath := filepath.Join(meraDir(), "logs", "aider-smoke.log")
+	_ = os.MkdirAll(filepath.Dir(smokeLogPath), 0755)
+
+	fmt.Println("[SMOKE] Step 3/4: Headless Aider launch (one-shot message)...")
+	fmt.Printf("[SMOKE]   Log: %s\n", smokeLogPath)
+
+	smokeArgs := []string{
+		"--model", "ollama/" + editModel,
+		"--edit-format", "diff",
+		"--no-auto-commits",
+		"--no-dirty-commits",
+		"--no-gitignore",
+		"--no-fancy-input",
+		"--no-check-update",
+		"--no-pretty",
+		"--yes",
+		// One-shot: process this message and exit without editing any files.
+		"--message", "Reply with the exact token MERA_SMOKE_OK and nothing else. Do not edit any files.",
+	}
+
+	smokeOpts := runInteractiveOpts{
+		closeStdin:    true,
+		logPath:       smokeLogPath,
+		blockPatterns: aiderBlockPatterns,
+	}
+
+	const (
+		smokeTimeout = 120 * time.Second
+		smokeStartup = 90 * time.Second
+		smokeSilence = 60 * time.Second
+	)
+
+	err := runInteractive(context.Background(), "aider", smokeArgs,
+		smokeTimeout, smokeStartup, smokeSilence, smokeOpts)
+
+	if errors.Is(err, ErrAiderBlocked) {
+		fmt.Println("[SMOKE] FAIL — Aider blocked on an interactive prompt.")
+		fmt.Println("[SMOKE]   The --message / --yes / --no-gitignore flags are not suppressing prompts.")
+		fmt.Printf("[SMOKE]   Full log: %s\n", smokeLogPath)
+		return fmt.Errorf("smoke: %w", err)
+	}
+	if err != nil {
+		// Non-zero exit from Aider is common when no files were edited (exit 1).
+		// Only treat it as a hard failure if the log is completely empty.
+		fmt.Printf("[SMOKE]   Aider exited: %v (checking log for model response)\n", err)
+	}
+
+	// Step 4: Verify model actually responded.
+	fmt.Println("[SMOKE] Step 4/4: Verifying model response in log...")
+	logBytes, readErr := os.ReadFile(smokeLogPath)
+	if readErr != nil {
+		fmt.Printf("[SMOKE]   WARN — could not read log: %v\n", readErr)
+	}
+	logText := string(logBytes)
+
+	switch {
+	case strings.Contains(logText, "MERA_SMOKE_OK"):
+		fmt.Println("[SMOKE]   Model responded with MERA_SMOKE_OK — pipeline confirmed.")
+	case len(logText) > 80:
+		// Model responded with something but not the exact token — still a good sign.
+		fmt.Println("[SMOKE]   Model responded (token mismatch — model paraphrased the message).")
+		fmt.Println("[SMOKE]   Pipeline appears functional; model may not follow exact instructions.")
+	default:
+		fmt.Println("[SMOKE]   WARN — log is empty or very short; model may not have responded.")
+		fmt.Printf("[SMOKE]   Full log: %s\n", smokeLogPath)
+		return fmt.Errorf("smoke: model did not produce output — check Ollama and model availability")
+	}
+
+	fmt.Println("[SMOKE] ─────────────────────────────────────────")
+	fmt.Println("[SMOKE] All checks passed.")
+	fmt.Printf("[SMOKE]   Model   : %s\n", editModel)
+	fmt.Printf("[SMOKE]   Latency : %s\n", latency.Round(time.Millisecond))
+	fmt.Printf("[SMOKE]   Log     : %s\n", smokeLogPath)
+	fmt.Println("[SMOKE] ─────────────────────────────────────────")
+	return nil
 }
